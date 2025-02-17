@@ -1,46 +1,67 @@
 require("dotenv").config()
 const TelegramBot = require("node-telegram-bot-api")
 const fs = require("fs")
+const path = require("path")
 
 const USER_BOT_TOKEN = process.env.USER_BOT_TOKEN
 const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN
 const ADMIN_CHAT_ID = Number.parseInt(process.env.ADMIN_CHAT_ID)
 
 // Bot yaratish
-const userBot = new TelegramBot(USER_BOT_TOKEN, { polling: true, filepath: false })
-const adminBot = new TelegramBot(ADMIN_BOT_TOKEN, { polling: true, filepath: false })
+const userBot = new TelegramBot(USER_BOT_TOKEN, {
+  polling: true,
+  filepath: false,
+  request: {
+    retryTimeout: 5000,
+  },
+})
+const adminBot = new TelegramBot(ADMIN_BOT_TOKEN, {
+  polling: true,
+  filepath: false,
+  request: {
+    retryTimeout: 5000,
+  },
+})
 
-let users = {}
+const users = {}
 let correctAnswers = {}
 let tests = []
 let lastMessageId = null
-let lastUserMessageId = {}
+const lastUserMessageId = {}
 
 // Bot ma'lumotlarini saqlash uchun
 let botInfo = {
   name: "Test Bot",
   description: "Test ishlash va tekshirish uchun bot",
   photo: "bot-photo.jpg",
-  createdAt: new Date().toISOString()
+  createdAt: new Date().toISOString(),
 }
+
+// Cache for active user sessions
+const userSessions = new Map()
 
 // Ma'lumotlarni saqlash va yuklash funksiyalari
 function saveData() {
   const data = {
     correctAnswers,
     tests,
-    botInfo
+    botInfo,
   }
-  fs.writeFileSync('data/botData.json', JSON.stringify(data))
+  fs.writeFileSync("data/botData.json", JSON.stringify(data))
 }
 
 function loadData() {
-  if (fs.existsSync('data/botData.json')) {
-    const data = JSON.parse(fs.readFileSync('data/botData.json'))
+  if (fs.existsSync("data/botData.json")) {
+    const data = JSON.parse(fs.readFileSync("data/botData.json"))
     correctAnswers = data.correctAnswers
     tests = data.tests
     botInfo = data.botInfo
   }
+}
+
+// Ensure data directory exists
+if (!fs.existsSync("data")) {
+  fs.mkdirSync("data")
 }
 
 // Bot ishga tushganda ma'lumotlarni yuklash
@@ -49,6 +70,30 @@ loadData()
 // Xatoliklarni nazorat qilish
 userBot.on("polling_error", (error) => console.log("User bot polling error:", error))
 adminBot.on("polling_error", (error) => console.log("Admin bot polling error:", error))
+
+// Function to update user sessions asynchronously
+async function updateUserSessions() {
+  for (const [chatId, session] of userSessions.entries()) {
+    try {
+      if (session.step === "test_in_progress") {
+        const updatedTest = tests.find((t) => t.name === session.currentTestId)
+        if (updatedTest && updatedTest.active) {
+          // Test is still active, no need to update
+          continue
+        }
+        // Test was deactivated or removed, notify user
+        await userBot.sendMessage(
+          chatId,
+          "⚠️ Kechirasiz, joriy test o'zgartirildi yoki o'chirildi. Iltimos, yangi test tanlang.",
+        )
+        await showUserMenu(chatId)
+        userSessions.delete(chatId)
+      }
+    } catch (error) {
+      console.error(`Error updating session for chat ${chatId}:`, error)
+    }
+  }
+}
 
 // === ADMIN BOT === //
 adminBot.onText(/\/start/, async (msg) => {
@@ -63,11 +108,7 @@ adminBot.onText(/\/setphoto/, async (msg) => {
   if (chatId !== ADMIN_CHAT_ID) return
 
   await deleteLastMessage(chatId)
-  const message = await adminBot.sendMessage(
-    chatId,
-    "🖼 <b>Botning yangi rasmini yuklang:</b>",
-    { parse_mode: "HTML" }
-  )
+  const message = await adminBot.sendMessage(chatId, "🖼 <b>Botning yangi rasmini yuklang:</b>", { parse_mode: "HTML" })
   lastMessageId = message.message_id
   users[chatId] = { step: "set_bot_photo" }
 })
@@ -77,11 +118,9 @@ adminBot.onText(/\/setdesc/, async (msg) => {
   if (chatId !== ADMIN_CHAT_ID) return
 
   await deleteLastMessage(chatId)
-  const message = await adminBot.sendMessage(
-    chatId,
-    "📝 <b>Botning yangi tavsifini yozing:</b>",
-    { parse_mode: "HTML" }
-  )
+  const message = await adminBot.sendMessage(chatId, "📝 <b>Botning yangi tavsifini yozing:</b>", {
+    parse_mode: "HTML",
+  })
   lastMessageId = message.message_id
   users[chatId] = { step: "set_bot_desc" }
 })
@@ -96,33 +135,19 @@ async function deleteLastMessage(chatId) {
   }
 }
 
-async function deleteLastUserMessage(chatId) {
-  if (lastUserMessageId[chatId]) {
-    try {
-      await userBot.deleteMessage(chatId, lastUserMessageId[chatId])
-    } catch (error) {
-      console.log("Error deleting user message:", error)
-    }
-  }
-}
-
 async function showAdminMainMenu(chatId) {
-  const msg = await adminBot.sendMessage(
-    chatId,
-    "🎯 <b>Admin paneliga xush kelibsiz</b>",
-    {
-      parse_mode: "HTML",
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "📝 Yangi test yaratish", callback_data: "create_test" }],
-          [{ text: "✅ Natija yaratish", callback_data: "create_result" }],
-          [{ text: "📊 Natijalar ro'yxati", callback_data: "show_answers" }],
-          [{ text: "🖼 Bot rasmini o'zgartirish", callback_data: "change_photo" }],
-          [{ text: "📝 Bot tavsifini o'zgartirish", callback_data: "change_desc" }]
-        ],
-      },
-    }
-  )
+  const msg = await adminBot.sendMessage(chatId, "🎯 <b>Admin paneliga xush kelibsiz</b>", {
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📝 Yangi test yaratish", callback_data: "create_test" }],
+        [{ text: "✅ Natija yaratish", callback_data: "create_result" }],
+        [{ text: "📊 Natijalar ro'yxati", callback_data: "show_answers" }],
+        [{ text: "🖼 Bot rasmini o'zgartirish", callback_data: "change_photo" }],
+        [{ text: "📝 Bot tavsifini o'zgartirish", callback_data: "change_desc" }],
+      ],
+    },
+  })
   lastMessageId = msg.message_id
 }
 
@@ -131,10 +156,10 @@ async function showTestList(chatId) {
 
   tests.forEach((test, index) => {
     keyboard.push([
-      { text: `📄 ${test.name}`, callback_data: `test:${index}` },
-      { 
-        text: test.active ? "🔴 O'chirish" : "🟢 Yoqish", 
-        callback_data: `toggle_activity:${index}` 
+      { text: `${test.name}`, callback_data: `test:${index}` },
+      {
+        text: test.active ? "🔴 O'chirish" : "🟢 Yoqish",
+        callback_data: `toggle_activity:${index}`,
       },
       { text: "🗑 Olib tashlash", callback_data: `remove_test:${index}` },
     ])
@@ -158,10 +183,10 @@ async function showAnswersList(chatId) {
 
   Object.entries(correctAnswers).forEach(([testId, data]) => {
     keyboard.push([
-      { text: `📝 ${testId}: ${data.answers}`, callback_data: `answer:${testId}` },
-      { 
-        text: data.active ? "🔴 O'chirish" : "🟢 Yoqish", 
-        callback_data: `toggle_answer:${testId}` 
+      { text: `${testId}: ${data.answers}`, callback_data: `answer:${testId}` },
+      {
+        text: data.active ? "🔴 O'chirish" : "🟢 Yoqish",
+        callback_data: `toggle_answer:${testId}`,
       },
       { text: "🗑 Olib tashlash", callback_data: `remove_answer:${testId}` },
     ])
@@ -191,18 +216,18 @@ adminBot.on("callback_query", async (query) => {
         await deleteLastMessage(chatId)
         await showTestList(chatId)
         break
-        
+
       case "create_result":
         await deleteLastMessage(chatId)
         const msg = await adminBot.sendMessage(
-          chatId, 
+          chatId,
           "📝 <b>To'g'ri javoblarni quyidagi formatda yozing:</b>\n\n<code>1211:ABCD...</code>",
           {
             parse_mode: "HTML",
             reply_markup: {
               inline_keyboard: [[{ text: "⬅️ Orqaga", callback_data: "back_to_main" }]],
             },
-          }
+          },
         )
         lastMessageId = msg.message_id
         break
@@ -214,11 +239,9 @@ adminBot.on("callback_query", async (query) => {
       case "add_new_test":
         await deleteLastMessage(chatId)
         users[chatId] = { step: "new_test_name" }
-        const newMsg = await adminBot.sendMessage(
-          chatId,
-          "📝 <b>Yangi test nomini kiriting:</b>",
-          { parse_mode: "HTML" }
-        )
+        const newMsg = await adminBot.sendMessage(chatId, "📝 <b>Yangi test nomini kiriting:</b>", {
+          parse_mode: "HTML",
+        })
         lastMessageId = newMsg.message_id
         break
 
@@ -229,22 +252,18 @@ adminBot.on("callback_query", async (query) => {
       case "change_photo":
         await deleteLastMessage(chatId)
         users[chatId] = { step: "set_bot_photo" }
-        const photoMsg = await adminBot.sendMessage(
-          chatId,
-          "🖼 <b>Botning yangi rasmini yuklang:</b>",
-          { parse_mode: "HTML" }
-        )
+        const photoMsg = await adminBot.sendMessage(chatId, "🖼 <b>Botning yangi rasmini yuklang:</b>", {
+          parse_mode: "HTML",
+        })
         lastMessageId = photoMsg.message_id
         break
 
       case "change_desc":
         await deleteLastMessage(chatId)
         users[chatId] = { step: "set_bot_desc" }
-        const descMsg = await adminBot.sendMessage(
-          chatId,
-          "📝 <b>Botning yangi tavsifini yozing:</b>",
-          { parse_mode: "HTML" }
-        )
+        const descMsg = await adminBot.sendMessage(chatId, "📝 <b>Botning yangi tavsifini yozing:</b>", {
+          parse_mode: "HTML",
+        })
         lastMessageId = descMsg.message_id
         break
 
@@ -252,19 +271,18 @@ adminBot.on("callback_query", async (query) => {
         if (data.startsWith("toggle_activity:")) {
           const testId = Number.parseInt(data.split(":")[1])
           tests[testId].active = !tests[testId].active
-          await adminBot.answerCallbackQuery(
-            query.id,
-            `✅ Test ${tests[testId].active ? "yoqildi" : "o'chirildi"}`
-          )
+          await adminBot.answerCallbackQuery(query.id, `✅ Test ${tests[testId].active ? "yoqildi" : "o'chirildi"}`)
           await showTestList(chatId)
+          updateUserSessions() // Update user sessions asynchronously
         } else if (data.startsWith("toggle_answer:")) {
           const testId = data.split(":")[1]
           correctAnswers[testId].active = !correctAnswers[testId].active
           await adminBot.answerCallbackQuery(
             query.id,
-            `✅ Natija ${correctAnswers[testId].active ? "yoqildi" : "o'chirildi"}`
+            `✅ Natija ${correctAnswers[testId].active ? "yoqildi" : "o'chirildi"}`,
           )
           await showAnswersList(chatId)
+          updateUserSessions() // Update user sessions asynchronously
         } else if (data.startsWith("remove_test:")) {
           const testId = Number.parseInt(data.split(":")[1])
           if (tests[testId]?.filename) {
@@ -277,11 +295,13 @@ adminBot.on("callback_query", async (query) => {
           tests.splice(testId, 1)
           await adminBot.answerCallbackQuery(query.id, "✅ Test o'chirildi")
           await showTestList(chatId)
+          updateUserSessions() // Update user sessions asynchronously
         } else if (data.startsWith("remove_answer:")) {
           const testId = data.split(":")[1]
           delete correctAnswers[testId]
           await adminBot.answerCallbackQuery(query.id, "✅ Natija o'chirildi")
           await showAnswersList(chatId)
+          updateUserSessions() // Update user sessions asynchronously
         }
     }
   } catch (error) {
@@ -302,11 +322,7 @@ adminBot.on("message", async (msg) => {
       users[chatId].newTestName = text
       users[chatId].step = "new_test_file"
       await deleteLastMessage(chatId)
-      const msg = await adminBot.sendMessage(
-        chatId, 
-        "📤 <b>Test PDF faylini yuklang</b>",
-        { parse_mode: "HTML" }
-      )
+      const msg = await adminBot.sendMessage(chatId, "📤 <b>Test PDF faylini yuklang</b>", { parse_mode: "HTML" })
       lastMessageId = msg.message_id
     } else if (text && text.includes(":")) {
       const [testId, answers] = text.split(":")
@@ -315,25 +331,18 @@ adminBot.on("message", async (msg) => {
         active: true,
       }
       await deleteLastMessage(chatId)
-      const msg = await adminBot.sendMessage(
-        chatId, 
-        "✅ <b>Natija saqlandi!</b>",
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [[{ text: "⬅️ Orqaga", callback_data: "back_to_main" }]],
-          },
-        }
-      )
+      const msg = await adminBot.sendMessage(chatId, "✅ <b>Natija saqlandi!</b>", {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[{ text: "⬅️ Orqaga", callback_data: "back_to_main" }]],
+        },
+      })
       lastMessageId = msg.message_id
+      updateUserSessions() // Update user sessions asynchronously
     } else if (users[chatId]?.step === "set_bot_desc") {
       botInfo.description = text
       await deleteLastMessage(chatId)
-      const message = await adminBot.sendMessage(
-        chatId,
-        "✅ <b>Bot tavsifi yangilandi!</b>",
-        { parse_mode: "HTML" }
-      )
+      const message = await adminBot.sendMessage(chatId, "✅ <b>Bot tavsifi yangilandi!</b>", { parse_mode: "HTML" })
       lastMessageId = message.message_id
       setTimeout(() => showAdminMainMenu(chatId), 1500)
       delete users[chatId]
@@ -368,19 +377,15 @@ adminBot.on("document", async (msg) => {
 
       delete users[chatId]
       await deleteLastMessage(chatId)
-      const message = await adminBot.sendMessage(
-        chatId, 
-        "✅ <b>Test muvaffaqiyatli qo'shildi!</b>",
-        { parse_mode: "HTML" }
-      )
+      const message = await adminBot.sendMessage(chatId, "✅ <b>Test muvaffaqiyatli qo'shildi!</b>", {
+        parse_mode: "HTML",
+      })
       lastMessageId = message.message_id
       setTimeout(() => showTestList(chatId), 1500)
+      updateUserSessions() // Update user sessions asynchronously
     } catch (error) {
       console.error("File upload error:", error)
-      await adminBot.sendMessage(
-        chatId, 
-        "❌ Fayl yuklashda xatolik yuz berdi. Qaytadan urinib ko'ring."
-      )
+      await adminBot.sendMessage(chatId, "❌ Fayl yuklashda xatolik yuz berdi. Qaytadan urinib ko'ring.")
     }
   }
 })
@@ -393,7 +398,7 @@ adminBot.on("photo", async (msg) => {
     try {
       const photo = msg.photo[msg.photo.length - 1] // Eng katta o'lchamdagi rasm
       const file = await adminBot.downloadFile(photo.file_id, "data")
-      
+
       // Eski rasmni o'chirish
       if (fs.existsSync(`data/${botInfo.photo}`)) {
         fs.unlinkSync(`data/${botInfo.photo}`)
@@ -405,11 +410,7 @@ adminBot.on("photo", async (msg) => {
       botInfo.photo = newFileName
 
       await deleteLastMessage(chatId)
-      const message = await adminBot.sendMessage(
-        chatId,
-        "✅ <b>Bot rasmi yangilandi!</b>",
-        { parse_mode: "HTML" }
-      )
+      const message = await adminBot.sendMessage(chatId, "✅ <b>Bot rasmi yangilandi!</b>", { parse_mode: "HTML" })
       lastMessageId = message.message_id
       setTimeout(() => showAdminMainMenu(chatId), 1500)
       delete users[chatId]
@@ -420,41 +421,35 @@ adminBot.on("photo", async (msg) => {
   }
 })
 
-
 // === USER BOT === //
 userBot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id
-  await deleteLastUserMessage(chatId)
 
   try {
     // Bot rasmini yuborish
     if (fs.existsSync(`data/${botInfo.photo}`)) {
-      await userBot.sendPhoto(
-        chatId,
-        fs.createReadStream(`data/${botInfo.photo}`),
-        {
-          caption: `🤖 <b>${botInfo.name}</b>\n\n📝 ${botInfo.description}\n\n⏰ Bot ishga tushirilgan vaqt: ${new Date(botInfo.createdAt).toLocaleString('uz-UZ')}`,
-          parse_mode: "HTML"
-        }
-      )
+      await userBot.sendPhoto(chatId, fs.createReadStream(`data/${botInfo.photo}`), {
+        caption: `🤖 <b>${botInfo.name}</b>\n\n📝 ${botInfo.description}\n\n⏰ Bot ishga tushirilgan vaqt: ${new Date(botInfo.createdAt).toLocaleString("uz-UZ")}`,
+        parse_mode: "HTML",
+      })
     }
 
     const message = await userBot.sendMessage(
-      chatId, 
+      chatId,
       "👋 <b>Assalomu alaykum!</b>\nIltimos, ismingiz va familiyangizni kiriting.",
-      { parse_mode: "HTML" }
+      { parse_mode: "HTML" },
     )
     lastUserMessageId[chatId] = message.message_id
-    users[chatId] = { step: "name" }
+    userSessions.set(chatId, { step: "name" })
   } catch (error) {
     console.error("Start command error:", error)
     const message = await userBot.sendMessage(
       chatId,
       "👋 <b>Assalomu alaykum!</b>\nIltimos, ismingiz va familiyangizni kiriting.",
-      { parse_mode: "HTML" }
+      { parse_mode: "HTML" },
     )
     lastUserMessageId[chatId] = message.message_id
-    users[chatId] = { step: "name" }
+    userSessions.set(chatId, { step: "name" })
   }
 })
 
@@ -462,15 +457,15 @@ userBot.on("message", async (msg) => {
   const chatId = msg.chat.id
   const text = msg.text
 
-  if (!users[chatId]) return
+  if (!userSessions.has(chatId)) return
 
   try {
-    if (users[chatId].step === "name") {
-      users[chatId].name = text
-      users[chatId].step = "phone"
-      await deleteLastUserMessage(chatId)
+    const session = userSessions.get(chatId)
+    if (session.step === "name") {
+      session.name = text
+      session.step = "phone"
       const message = await userBot.sendMessage(
-        chatId, 
+        chatId,
         `👤 Rahmat, <b>${text}</b>.\n📱 Endi telefon raqamingizni ulashing:`,
         {
           parse_mode: "HTML",
@@ -479,20 +474,18 @@ userBot.on("message", async (msg) => {
             resize_keyboard: true,
             one_time_keyboard: true,
           },
-        }
+        },
       )
       lastUserMessageId[chatId] = message.message_id
-    } else if (users[chatId].step === "check_answers") {
+      userSessions.set(chatId, session)
+    } else if (session.step === "check_answers") {
       const [testId, answers] = text.split(":")
       if (!correctAnswers[testId] || !correctAnswers[testId].active) {
-        await deleteLastUserMessage(chatId)
-        const message = await userBot.sendMessage(
-          chatId, 
-          "❌ Bu test ID bo'yicha natijalar topilmadi."
-        )
+        const message = await userBot.sendMessage(chatId, "❌ Bu test ID bo'yicha natijalar topilmadi.")
         lastUserMessageId[chatId] = message.message_id
         setTimeout(() => showUserMenu(chatId), 1500)
-        users[chatId].step = "menu"
+        session.step = "menu"
+        userSessions.set(chatId, session)
         return
       }
 
@@ -505,66 +498,69 @@ userBot.on("message", async (msg) => {
         else wrongCount++
       }
 
-      await deleteLastUserMessage(chatId)
       const message = await userBot.sendMessage(
         chatId,
         `📊 <b>Natijangiz:</b>\n✅ To'g'ri: ${correctCount}\n❌ Noto'g'ri: ${wrongCount}`,
-        { parse_mode: "HTML" }
+        { parse_mode: "HTML" },
       )
       lastUserMessageId[chatId] = message.message_id
 
       // Admin botga natijalarni yuborish
-      await sendResultToAdmin(users[chatId], testId, correctCount, wrongCount)
+      await sendResultToAdmin(session, testId, correctCount, wrongCount)
 
       setTimeout(() => showUserMenu(chatId), 2000)
-      users[chatId].step = "menu"
+      session.step = "menu"
+      userSessions.set(chatId, session)
     } else if (text === "📝 Test tekshirish") {
-      users[chatId].step = "check_answers"
-      await deleteLastUserMessage(chatId)
+      session.step = "check_answers"
       const message = await userBot.sendMessage(
-        chatId, 
+        chatId,
         "📝 Javoblarni quyidagi formatda yozing:\n<code>1211:ABCD...</code>",
-        { parse_mode: "HTML" }
+        { parse_mode: "HTML" },
       )
       lastUserMessageId[chatId] = message.message_id
+      userSessions.set(chatId, session)
     } else if (text === "📚 Test ishlash") {
       try {
         const activeTests = tests.filter((test) => test.active)
         if (activeTests.length === 0) {
-          await deleteLastUserMessage(chatId)
-          const message = await userBot.sendMessage(
-            chatId, 
-            "❌ Hozircha faol testlar yo'q."
-          )
+          const message = await userBot.sendMessage(chatId, "❌ Hozircha faol testlar yo'q.")
           lastUserMessageId[chatId] = message.message_id
           setTimeout(() => showUserMenu(chatId), 1500)
           return
         }
 
         const randomTest = activeTests[Math.floor(Math.random() * activeTests.length)]
-        await deleteLastUserMessage(chatId)
+        const filePath = path.join("data", randomTest.filename)
 
-        if (!fs.existsSync(`data/${randomTest.filename}`)) {
-          throw new Error(`Test file not found: ${randomTest.filename}`)
+        if (!fs.existsSync(filePath)) {
+          console.error(`Test file not found: ${filePath}`)
+          await userBot.sendMessage(chatId, "❌ Kechirasiz, test fayli topilmadi. Iltimos, adminga murojaat qiling.")
+          await notifyAdminAboutMissingFile(randomTest)
+          setTimeout(() => showUserMenu(chatId), 1500)
+          return
         }
 
-        await userBot.sendDocument(chatId, fs.createReadStream(`data/${randomTest.filename}`))
+        // Send document without storing message ID
+        await userBot.sendDocument(chatId, fs.createReadStream(filePath))
+
+        // Store only the menu message ID
         const message = await userBot.sendMessage(
-          chatId, 
-          "📝 Javoblarni yuborish uchun 'Javob berish' tugmasini bosing",
+          chatId,
+          `📝 Test ID: ${randomTest.name}\nJavoblarni yuborish uchun 'Javob berish' tugmasini bosing`,
           {
             reply_markup: {
               inline_keyboard: [[{ text: "✍️ Javob berish", callback_data: "submit_answers" }]],
             },
-          }
+          },
         )
         lastUserMessageId[chatId] = message.message_id
+        session.currentTestId = randomTest.name
+        session.step = "test_in_progress"
+        userSessions.set(chatId, session)
       } catch (error) {
         console.error("Error in Test ishlash:", error)
-        await userBot.sendMessage(
-          chatId, 
-          "❌ Test yuklashda xatolik yuz berdi. Iltimos, adminga murojaat qiling."
-        )
+        await userBot.sendMessage(chatId, "❌ Test yuklashda xatolik yuz berdi. Iltimos, adminga murojaat qiling.")
       }
     }
   } catch (error) {
@@ -577,10 +573,11 @@ userBot.on("contact", async (msg) => {
   const chatId = msg.chat.id
   const phone = msg.contact.phone_number
 
-  if (users[chatId]?.step === "phone") {
-    users[chatId].phone = phone
-    users[chatId].step = "menu"
-    await deleteLastUserMessage(chatId)
+  if (userSessions.has(chatId) && userSessions.get(chatId).step === "phone") {
+    const session = userSessions.get(chatId)
+    session.phone = phone
+    session.step = "menu"
+    userSessions.set(chatId, session)
     await showUserMenu(chatId)
   }
 })
@@ -588,33 +585,26 @@ userBot.on("contact", async (msg) => {
 userBot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id
   if (query.data === "submit_answers") {
-    users[chatId].step = "check_answers"
-    await deleteLastUserMessage(chatId)
+    const session = userSessions.get(chatId)
+    session.step = "check_answers"
     const message = await userBot.sendMessage(
-      chatId, 
-      "📝 Javoblaringizni quyidagi formatda yuboring:\n<code>1211:ABCD...</code>",
-      { parse_mode: "HTML" }
+      chatId,
+      `📝 Test ID: ${session.currentTestId}\nJavoblaringizni quyidagi formatda yuboring:\n<code>${session.currentTestId}:ABCD...</code>`,
+      { parse_mode: "HTML" },
     )
     lastUserMessageId[chatId] = message.message_id
+    userSessions.set(chatId, session)
   }
 })
 
 async function showUserMenu(chatId) {
-  await deleteLastUserMessage(chatId)
-  const message = await userBot.sendMessage(
-    chatId, 
-    "📋 <b>Qanday harakat qilamiz?</b>",
-    {
-      parse_mode: "HTML",
-      reply_markup: {
-        keyboard: [
-          [{ text: "📝 Test tekshirish" }],
-          [{ text: "📚 Test ishlash" }]
-        ],
-        resize_keyboard: true,
-      },
-    }
-  )
+  const message = await userBot.sendMessage(chatId, "📋 <b>Qanday harakat qilamiz?</b>", {
+    parse_mode: "HTML",
+    reply_markup: {
+      keyboard: [[{ text: "📝 Test tekshirish" }], [{ text: "📚 Test ishlash" }]],
+      resize_keyboard: true,
+    },
+  })
   lastUserMessageId[chatId] = message.message_id
 }
 
@@ -623,8 +613,16 @@ async function sendResultToAdmin(user, testId, correctCount, wrongCount) {
   const now = new Date()
   await adminBot.sendMessage(
     ADMIN_CHAT_ID,
-    `👤 <b>Foydalanuvchi:</b> ${user.name}\n📱 <b>Tel:</b> ${user.phone}\n🔢 <b>Test ID:</b> ${testId}\n📊 <b>Natija:</b> ${correctCount} to'g'ri, ${wrongCount} noto'g'ri\n🕒 <b>Yuborilgan vaqt:</b> ${now.toLocaleString('uz-UZ')}`,
-    { parse_mode: "HTML" }
+    `👤 <b>Foydalanuvchi:</b> ${user.name}\n📱 <b>Tel:</b> ${user.phone}\n🔢 <b>Test ID:</b> ${testId}\n📊 <b>Natija:</b> ${correctCount} to'g'ri, ${wrongCount} noto'g'ri\n🕒 <b>Yuborilgan vaqt:</b> ${now.toLocaleString("uz-UZ")}`,
+    { parse_mode: "HTML" },
+  )
+}
+
+async function notifyAdminAboutMissingFile(test) {
+  await adminBot.sendMessage(
+    ADMIN_CHAT_ID,
+    `⚠️ <b>Diqqat!</b>\n\nQuyidagi test fayli topilmadi:\nTest nomi: ${test.name}\nFayl nomi: ${test.filename}\n\nIltimos, faylni tekshiring va qayta yuklang.`,
+    { parse_mode: "HTML" },
   )
 }
 
@@ -632,7 +630,7 @@ async function sendResultToAdmin(user, testId, correctCount, wrongCount) {
 console.log("🚀 Bot ishga tushdi!")
 
 // Ma'lumotlarni saqlash
-process.on('SIGINT', () => {
+process.on("SIGINT", () => {
   saveData()
   process.exit()
 })
@@ -641,3 +639,19 @@ process.on('SIGINT', () => {
 process.on("unhandledRejection", (error) => {
   console.log("unhandledRejection:", error)
 })
+
+// Add error handlers for both bots
+userBot.on("error", (error) => {
+  console.log("User bot error:", error.code)
+  if (error.code === "EFATAL") {
+    process.exit(1)
+  }
+})
+
+adminBot.on("error", (error) => {
+  console.log("Admin bot error:", error.code)
+  if (error.code === "EFATAL") {
+    process.exit(1)
+  }
+})
+
