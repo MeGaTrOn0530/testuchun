@@ -528,31 +528,44 @@ userBot.on("message", async (msg) => {
       )
       lastUserMessageId[chatId] = message.message_id
     } else if (text === "📚 Test ishlash") {
-      const activeTests = tests.filter((test) => test.active)
-      if (activeTests.length === 0) {
+      try {
+        const activeTests = tests.filter((test) => test.active)
+        if (activeTests.length === 0) {
+          await deleteLastUserMessage(chatId)
+          const message = await userBot.sendMessage(
+            chatId, 
+            "❌ Hozircha faol testlar yo'q."
+          )
+          lastUserMessageId[chatId] = message.message_id
+          setTimeout(() => showUserMenu(chatId), 1500)
+          return
+        }
+
+        const randomTest = activeTests[Math.floor(Math.random() * activeTests.length)]
         await deleteLastUserMessage(chatId)
+
+        if (!fs.existsSync(`data/${randomTest.filename}`)) {
+          throw new Error(`Test file not found: ${randomTest.filename}`)
+        }
+
+        await userBot.sendDocument(chatId, fs.createReadStream(`data/${randomTest.filename}`))
         const message = await userBot.sendMessage(
           chatId, 
-          "❌ Hozircha faol testlar yo'q."
+          "📝 Javoblarni yuborish uchun 'Javob berish' tugmasini bosing",
+          {
+            reply_markup: {
+              inline_keyboard: [[{ text: "✍️ Javob berish", callback_data: "submit_answers" }]],
+            },
+          }
         )
         lastUserMessageId[chatId] = message.message_id
-        setTimeout(() => showUserMenu(chatId), 1500)
-        return
+      } catch (error) {
+        console.error("Error in Test ishlash:", error)
+        await userBot.sendMessage(
+          chatId, 
+          "❌ Test yuklashda xatolik yuz berdi. Iltimos, adminga murojaat qiling."
+        )
       }
-
-      const randomTest = activeTests[Math.floor(Math.random() * activeTests.length)]
-      await deleteLastUserMessage(chatId)
-      await userBot.sendDocument(chatId, fs.createReadStream(`data/${randomTest.filename}`))
-      const message = await userBot.sendMessage(
-        chatId, 
-        "📝 Javoblarni yuborish uchun 'Javob berish' tugmasini bosing",
-        {
-          reply_markup: {
-            inline_keyboard: [[{ text: "✍️ Javob berish", callback_data: "submit_answers" }]],
-          },
-        }
-      )
-      lastUserMessageId[chatId] = message.message_id
     }
   } catch (error) {
     console.error("User message handling error:", error)
